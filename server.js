@@ -10,6 +10,11 @@ import rateLimit from 'express-rate-limit';
 import { nanoid } from 'nanoid';
 import { authenticator } from 'otplib';
 import QRCode from 'qrcode';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 import { initDb, getDb } from './lib/db.js';
 import {
@@ -25,6 +30,16 @@ import {
   getAllUsers,
   userExists
 } from './lib/auth.js';
+
+import {
+  initDocker,
+  createContainer,
+  startContainer,
+  stopContainer,
+  removeContainer,
+  getContainerStatus,
+  listUserContainers
+} from './lib/docker.js';
 
 const SESSION_SECRET = process.env.SESSION_SECRET || nanoid(32);
 const SESSION_EXPIRY = parseInt(process.env.SESSION_EXPIRY || '86400000'); // 24 hours
@@ -373,10 +388,166 @@ export async function createApp() {
   // User Routes (authenticated)
   // ==========================================
 
-  app.get('/api/user/apps', requireAuth, (req, res) => {
-    const db = getDb();
-    const apps = db.prepare('SELECT * FROM containers WHERE user_id = ?').all(req.user.id);
-    res.json({ apps });
+  app.get('/api/user/apps', requireAuth, async (req, res) => {
+    try {
+      const apps = await listUserContainers(req.user.id);
+      res.json({ apps });
+    } catch (error) {
+      console.error('Error fetching apps:', error);
+      res.status(500).json({ error: 'Failed to fetch apps' });
+    }
+  });
+
+  /**
+   * POST /api/user/apps - Create a new container
+   */
+  app.post('/api/user/apps', requireAuth, async (req, res) => {
+    try {
+      const { appType, subdomain, cpuLimit, memoryLimit } = req.body;
+
+      if (!appType || !subdomain) {
+        return res.status(400).json({ error: 'appType and subdomain are required' });
+      }
+
+      const container = await createContainer({
+        userId: req.user.id,
+        appType,
+        subdomain,
+        cpuLimit,
+        memoryLimit
+      });
+
+      res.status(201).json({ container });
+    } catch (error) {
+      console.error('Error creating container:', error);
+      if (error.message.includes('not found')) {
+        return res.status(400).json({ error: error.message });
+      }
+      if (error.message.includes('exists')) {
+        return res.status(400).json({ error: error.message });
+      }
+      res.status(500).json({ error: 'Failed to create container' });
+    }
+  });
+
+  /**
+   * POST /api/user/apps/:id/start - Start a container
+   */
+  app.post('/api/user/apps/:id/start', requireAuth, async (req, res) => {
+    try {
+      const containerId = parseInt(req.params.id);
+
+      // Verify container belongs to user
+      const db = getDb();
+      const container = db.prepare('SELECT * FROM containers WHERE id = ?').get(containerId);
+
+      if (!container) {
+        return res.status(404).json({ error: 'Container not found' });
+      }
+
+      if (container.user_id !== req.user.id && req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+
+      const result = await startContainer(containerId);
+      res.json(result);
+    } catch (error) {
+      console.error('Error starting container:', error);
+      if (error.message.includes('not found')) {
+        return res.status(404).json({ error: error.message });
+      }
+      res.status(500).json({ error: 'Failed to start container' });
+    }
+  });
+
+  /**
+   * POST /api/user/apps/:id/stop - Stop a container
+   */
+  app.post('/api/user/apps/:id/stop', requireAuth, async (req, res) => {
+    try {
+      const containerId = parseInt(req.params.id);
+
+      // Verify container belongs to user
+      const db = getDb();
+      const container = db.prepare('SELECT * FROM containers WHERE id = ?').get(containerId);
+
+      if (!container) {
+        return res.status(404).json({ error: 'Container not found' });
+      }
+
+      if (container.user_id !== req.user.id && req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+
+      const result = await stopContainer(containerId);
+      res.json(result);
+    } catch (error) {
+      console.error('Error stopping container:', error);
+      if (error.message.includes('not found')) {
+        return res.status(404).json({ error: error.message });
+      }
+      res.status(500).json({ error: 'Failed to stop container' });
+    }
+  });
+
+  /**
+   * DELETE /api/user/apps/:id - Delete a container
+   */
+  app.delete('/api/user/apps/:id', requireAuth, async (req, res) => {
+    try {
+      const containerId = parseInt(req.params.id);
+
+      // Verify container belongs to user
+      const db = getDb();
+      const container = db.prepare('SELECT * FROM containers WHERE id = ?').get(containerId);
+
+      if (!container) {
+        return res.status(404).json({ error: 'Container not found' });
+      }
+
+      if (container.user_id !== req.user.id && req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+
+      const result = await removeContainer(containerId);
+      res.json(result);
+    } catch (error) {
+      console.error('Error deleting container:', error);
+      if (error.message.includes('not found')) {
+        return res.status(404).json({ error: error.message });
+      }
+      res.status(500).json({ error: 'Failed to delete container' });
+    }
+  });
+
+  /**
+   * GET /api/user/apps/:id/status - Get container status
+   */
+  app.get('/api/user/apps/:id/status', requireAuth, async (req, res) => {
+    try {
+      const containerId = parseInt(req.params.id);
+
+      // Verify container belongs to user
+      const db = getDb();
+      const container = db.prepare('SELECT * FROM containers WHERE id = ?').get(containerId);
+
+      if (!container) {
+        return res.status(404).json({ error: 'Container not found' });
+      }
+
+      if (container.user_id !== req.user.id && req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+
+      const status = await getContainerStatus(containerId);
+      res.json(status);
+    } catch (error) {
+      console.error('Error getting container status:', error);
+      if (error.message.includes('not found')) {
+        return res.status(404).json({ error: error.message });
+      }
+      res.status(500).json({ error: 'Failed to get container status' });
+    }
   });
 
   // ==========================================
@@ -387,6 +558,85 @@ export async function createApp() {
     const users = getAllUsers();
     res.json({ users });
   });
+
+  /**
+   * GET /api/admin/containers - List all containers (admin only)
+   */
+  app.get('/api/admin/containers', requireAuth, requireAdmin, (req, res) => {
+    try {
+      const db = getDb();
+      const containers = db.prepare(`
+        SELECT c.*, u.username as owner_username
+        FROM containers c
+        LEFT JOIN users u ON c.user_id = u.id
+        ORDER BY c.created_at DESC
+      `).all();
+      res.json({ containers });
+    } catch (error) {
+      console.error('Error fetching all containers:', error);
+      res.status(500).json({ error: 'Failed to fetch containers' });
+    }
+  });
+
+  /**
+   * GET /api/admin/app-types - List all app types
+   */
+  app.get('/api/admin/app-types', requireAuth, requireAdmin, (req, res) => {
+    try {
+      const db = getDb();
+      const appTypes = db.prepare('SELECT * FROM app_types ORDER BY name').all();
+      res.json({ appTypes });
+    } catch (error) {
+      console.error('Error fetching app types:', error);
+      res.status(500).json({ error: 'Failed to fetch app types' });
+    }
+  });
+
+  /**
+   * POST /api/admin/app-types - Create a new app type
+   */
+  app.post('/api/admin/app-types', requireAuth, requireAdmin, (req, res) => {
+    try {
+      const { name, displayName, dockerImage, defaultPort, description } = req.body;
+
+      if (!name || !dockerImage || !defaultPort) {
+        return res.status(400).json({ error: 'name, dockerImage, and defaultPort are required' });
+      }
+
+      const db = getDb();
+
+      // Check if app type already exists
+      const existing = db.prepare('SELECT id FROM app_types WHERE name = ?').get(name);
+      if (existing) {
+        return res.status(400).json({ error: 'App type already exists' });
+      }
+
+      const result = db.prepare(`
+        INSERT INTO app_types (name, display_name, docker_image, default_port, description, enabled)
+        VALUES (?, ?, ?, ?, ?, 1)
+      `).run(name, displayName || name, dockerImage, defaultPort, description || '');
+
+      const appType = db.prepare('SELECT * FROM app_types WHERE id = ?').get(result.lastInsertRowid);
+      res.status(201).json({ appType });
+    } catch (error) {
+      console.error('Error creating app type:', error);
+      res.status(500).json({ error: 'Failed to create app type' });
+    }
+  });
+
+  // ==========================================
+  // Static Files (Production)
+  // ==========================================
+
+  if (process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'test') {
+    const distPath = join(__dirname, 'dist');
+    app.use(express.static(distPath));
+
+    // SPA fallback - serve index.html for all non-API routes
+    app.get('*', (req, res) => {
+      res.sendFile(join(distPath, 'index.html'));
+    });
+  }
 
   return app;
 }
